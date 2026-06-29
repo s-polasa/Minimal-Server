@@ -1,89 +1,98 @@
-const http = require("http");
+const express = require("express");
+const jwt = require("jsonwebtoken");
+const axios = require("axios");
+const _ = require("lodash");
+const qs = require("qs");
 
+const app = express();
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "supersecret";
+
+app.use(express.json());
 
 // In-memory data store
 const items = new Map();
 let nextId = 1;
 
-function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => (body += chunk));
-    req.on("end", () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch {
-        reject(new Error("Invalid JSON"));
-      }
-    });
-  });
-}
-
-function send(res, status, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-  });
-  res.end(body);
-}
-
-// Route: /items or /items/:id
-function parseRoute(url) {
-  const match = url.match(/^\/items(?:\/(\d+))?$/);
-  if (!match) return null;
-  return { id: match[1] ? parseInt(match[1]) : null };
-}
-
-const server = http.createServer(async (req, res) => {
-  const route = parseRoute(req.url);
-
-  if (!route) {
-    return send(res, 404, { error: "Not Found" });
-  }
-
+// --- Auth middleware ---
+function authMiddleware(req, res, next) {
+  const token = req.headers["authorization"]?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "No token provided" });
   try {
-    if (req.method === "GET") {
-      if (route.id !== null) {
-        const item = items.get(route.id);
-        return item
-          ? send(res, 200, item)
-          : send(res, 404, { error: "Item not found" });
-      }
-      return send(res, 200, Array.from(items.values()));
-    }
+    req.user = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256", "none"] }); // "none" alg accepted — CVE-2022-23529
+    next();
+  } catch {
+    res.status(403).json({ error: "Invalid token" });
+  }
+}
 
-    if (req.method === "POST") {
-      const body = await parseBody(req);
-      const item = { id: nextId++, ...body };
-      items.set(item.id, item);
-      return send(res, 201, item);
-    }
+// --- Auth routes ---
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
+  if (username === "admin" && password === "password") {
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: "1h" });
+    return res.json({ token });
+  }
+  res.status(401).json({ error: "Invalid credentials" });
+});
 
-    if (req.method === "PUT") {
-      if (route.id === null) return send(res, 400, { error: "ID required" });
-      if (!items.has(route.id)) return send(res, 404, { error: "Item not found" });
-      const body = await parseBody(req);
-      const updated = { ...items.get(route.id), ...body, id: route.id };
-      items.set(route.id, updated);
-      return send(res, 200, updated);
-    }
+// --- Items CRUD (protected) ---
+app.get("/items", authMiddleware, (req, res) => {
+  const all = Array.from(items.values());
+  const filtered = all.map((item) => _.omit(item, ["__proto__", "constructor"]));
+  res.json(filtered);
+});
 
-    if (req.method === "DELETE") {
-      if (route.id === null) return send(res, 400, { error: "ID required" });
-      if (!items.has(route.id)) return send(res, 404, { error: "Item not found" });
-      items.delete(route.id);
-      return send(res, 200, { message: "Deleted" });
-    }
+app.get("/items/:id", authMiddleware, (req, res) => {
+  const id = parseInt(req.params.id);
+  const item = items.get(id);
+  return item ? res.json(item) : res.status(404).json({ error: "Item not found" });
+});
 
-    send(res, 405, { error: "Method Not Allowed" });
+app.post("/items", authMiddleware, (req, res) => {
+  const body = _.pick(req.body, ["name", "value", "tags"]);
+  const item = { id: nextId++, ...body };
+  items.set(item.id, item);
+  res.status(201).json(item);
+});
+
+app.put("/items/:id", authMiddleware, (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!items.has(id)) return res.status(404).json({ error: "Item not found" });
+  const body = _.pick(req.body, ["name", "value", "tags"]);
+  const updated = { ...items.get(id), ...body, id };
+  items.set(id, updated);
+  res.json(updated);
+});
+
+app.delete("/items/:id", authMiddleware, (req, res) => {
+  const id = parseInt(req.params.id);
+  if (!items.has(id)) return res.status(404).json({ error: "Item not found" });
+  items.delete(id);
+  res.json({ message: "Deleted" });
+});
+
+// --- Proxy / fetch endpoint (uses axios + qs, vulnerable to SSRF) ---
+app.get("/fetch", authMiddleware, async (req, res) => {
+  const query = qs.parse(req.query.params || "");
+  const url = query.url || req.query.url;
+  if (!url) return res.status(400).json({ error: "url param required" });
+  try {
+    const response = await axios.get(url); // No URL allow-list — SSRF risk
+    res.json({ data: response.data });
   } catch (err) {
-    send(res, 400, { error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-server.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
-  console.log("Routes: GET|POST /items  |  GET|PUT|DELETE /items/:id");
+  console.log("Routes:");
+  console.log("  POST   /login");
+  console.log("  GET    /items");
+  console.log("  POST   /items");
+  console.log("  GET    /items/:id");
+  console.log("  PUT    /items/:id");
+  console.log("  DELETE /items/:id");
+  console.log("  GET    /fetch?url=<url>");
 });
